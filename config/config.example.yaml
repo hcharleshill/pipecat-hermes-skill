@@ -1,0 +1,30 @@
+# Pipecat Hermes Skill — example configuration
+#
+# Setup:
+#   cp config/config.example.yaml config/config.yaml
+#   # Edit config.yaml for your Hermes endpoint and API key.
+#
+# Secrets: do not commit config/config.yaml with real API keys.
+
+hermes:
+  # Hermes API server (OpenAI-compatible) — typical local dev:
+  endpoint: "http://localhost:8080"
+  backend: "openai"          # openai | hermes | ollama
+  model: "hermes-agent"
+  api_key: "CHANGE_ME"       # Bearer token your Hermes gateway expects
+  timeout_seconds: 300
+
+pipecat:
+  stt:
+    engine: "faster-whisper"
+    model: "base"            # tiny | base | small — larger = slower, more accurate
+  tts:
+    engine: "piper"
+
+session:
+  timeout_seconds: 300
+  persist: true
+  persist_dir: "sessions"    # git-ignored runtime conversation JSON
+
+logging:
+  level: "INFO"

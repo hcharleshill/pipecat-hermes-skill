@@ -1,0 +1,24 @@
+# Pipecat Hermes Skill — Python dependencies (alpha)
+# Python 3.11+ recommended (3.12 tested). Use a venv:
+#   python3 -m venv .venv && source .venv/bin/activate
+#   pip install -r requirements.txt
+#
+# GPU STT: faster-whisper uses ctranslate2. NVIDIA CUDA speeds transcription
+# significantly; CPU fallback is automatic if CUDA is unavailable (slower).
+# Piper TTS runs on CPU via onnxruntime for all installs.
+
+# Core skill
+pydantic>=2.5,<3
+PyYAML>=6.0
+
+# STT / TTS (local, private)
+faster-whisper>=1.0.0
+piper-tts>=1.2.0
+onnxruntime>=1.16.0
+
+# Asterisk ARI bridge (uses vendored ari.py in project root — not the PyPI package)
+requests>=2.31.0
+websocket-client>=1.6.0
+
+# Transitive / runtime (pinned loosely — pip resolves per platform)
+numpy>=1.24.0

@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+
+# Local config (copy from config.example.yaml)
+config/config.yaml
+
+# Secrets / env
+.env
+.env.*
+
+# Runtime data
+sessions/
+*.log
+*.wav
+
+# Models (download via scripts/download_piper_voice.sh)
+models/*.onnx
+models/*.onnx.json
+*.onnx
+*.onnx.json
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+*~
+
+# Keep directory placeholders
+!models/README.md
+!models/.gitkeep
