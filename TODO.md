@@ -1,41 +1,87 @@
-# Pipecat Hermes Skill – TODO
+# Pipecat Hermes Skill / Asterisk Voice Agent UX Skill - TODO
 
-## High Priority
+This repo currently acts as middleware between Asterisk phone calls and text-first
+AI agents such as Hermes, Openclaw, Ollama, or OpenAI-compatible gateways. The
+original Pipecat/Hermes name is still present in code and docs, but the working
+product shape is an Asterisk voice-agent UX skill: turn taking, barge-in,
+dead-air handling, STT, agent routing, TTS, and RTP playback.
 
-- [x] Replace pseudocode in `handle_incoming_audio()` with real Pipecat STT integration   (audio buffering + new process_audio_turn() using local stt module on temp WAV)
-- [x] Replace pseudocode in `route_message()` with real Pipecat TTS integration   (local tts.synthesize + delivery via pipeline.send_audio or captured bytes)
-- [x] Implement actual Hermes client call in `_send_to_hermes()`   (delegates to injected client supporting common shapes + error handling + safe fallbacks)
-- [x] Add configuration loading from `config/config.yaml`   (fully implemented + global config)
-- [x] Wire in Faster-Whisper (base model) for local STT   (module + full integration path complete)
-- [x] Wire in Piper for local TTS   (module + full integration path complete)
-- [x] Implement turn-boundary detection (initial):
-  - Long pause → is_turn_complete() + process_if_turn_complete()
-  - “Over” + short pause → _text_has_turn_cue() after STT
-  - Tag question (“right?”, “yes?”, “okay?”, etc.) + short pause → same cue detector
-  - Callers (transport) can poll process_if_turn_complete() or combine with cues
-- [x] Implement interruption handling (basic):
-  - Automatic energy-based barge-in detection in handle_incoming_audio while speaking
-  - on_user_barge_in() + is_speaking state (transport can stop playback)
-  - get_barge_in_acknowledgement() → "Go ahead." audio
-  - get_resume_prompt() → "As I was saying. " + previous response
-  - (Full sentence completion / precise remainder timing would require streaming TTS position tracking)
+## Recently Completed
 
-## Medium Priority
+- [x] Wire Asterisk ARI + ExternalMedia RTP into the skill.
+- [x] Implement local Faster-Whisper STT and Piper TTS.
+- [x] Add turn-boundary detection with long-pause and short-pause-after-cue logic.
+- [x] Add basic barge-in / interruption handling.
+- [x] Add session persistence, timeout cleanup, and lifecycle hooks.
+- [x] Add Hermes/OpenAI/Ollama-style HTTP agent client support.
+- [x] Add short acknowledgements, thinking bleeps, and long-wait spoken cues.
+- [x] Add background TTS cache warmup.
+- [x] Add background STT model warmup to reduce first-turn latency.
+- [x] Remove temp-WAV use from live STT turns with `stt.transcribe_pcm16()`.
+- [x] Add chunked Piper PCM output with `tts.iter_synthesize_pcm16_chunks()`.
+- [x] Stream final TTS responses through the RTP pacer instead of waiting for a full WAV.
+- [x] Move PCM/u-law/resampling/RMS/WAV helpers into `src.media`.
+- [x] Add optional `src._media_native` hook for a future compiled media backend.
+- [x] Add `audioop-lts` compatibility for Python 3.13+.
+- [x] Add setup preflight checks in `scripts/preflight.py`.
+- [x] Add media unit tests.
 
-- [x] Implement proper session persistence   (SessionManager now supports optional JSON persistence in persist_dir + timeout enforcement from config; history survives restarts; update_and_persist() + cleanup_expired() added. Wired into PipecatHermesSkill using config.session.*)
-- [x] Add logging and error handling   (error_handler enhanced with session context, recoverable flag, get_user_friendly_message helper; skill applies config logging more carefully; handle_error called with session_ids; _send_to_hermes now does 2-attempt retry with backoff for Hermes calls.)
-- [x] Support multiple concurrent sessions   (RLock + protected sections already present; added end_session(), add_on_session_end() lifecycle hooks, cleanup_expired_sessions(), _cleanup_transient_for_expired integration, and clear state-separation design comments. Bridge now uses end_session(). Transient acoustic state intentionally kept separate from durable SessionManager for performance/reusability.)
-- [x] Create unit tests for core routing logic   (created tests/test_session_manager.py (persistence, timeout, cleanup) + tests/test_turn_cues.py (isolated cue detector). All pass with stdlib only. Core routing paths now have basic coverage.)
-- [x] Document how this skill differs from the original Telegram skill   (added detailed "Differences from the Original Hermes Telegram Skill" section to ARCHITECTURE.md covering transport, turn logic, persistence, concurrency, state separation, and tests)
+## Next Up
 
-## Future / Polish
+- [ ] Merge `asterisk-voice-agent-ux-skill` into `main` after review.
+- [ ] Run live-call validation on the real Asterisk/Hermes host:
+  - [ ] `python scripts/preflight.py`
+  - [ ] `python -m unittest discover -s tests -v`
+  - [ ] Dial `100` echo test.
+  - [ ] Dial `101` live agent test.
+  - [ ] Check first-turn latency, response start time, choppy playback, hangup cleanup, and barge-in behavior.
+- [ ] Add timing instrumentation around the live call path:
+  - [ ] STT transcription latency.
+  - [ ] Hermes/agent request latency.
+  - [ ] Time to first TTS PCM chunk.
+  - [ ] Total TTS generation time.
+  - [ ] RTP queue depth and underrun/backpressure events.
+- [ ] Update README language toward "Asterisk Voice Agent UX Skill" while keeping Hermes/Pipecat history clear.
 
-- [x] Add metrics and observability hooks   (lightweight counters in PipecatHermesSkill: turns_processed, barge_ins, hermes_calls/errors, tts_syntheses, last_route_latency_ms + get_metrics() snapshot. No deps.)
-- [ ] Support dynamic model swapping (STT/TTS)   (stt/tts use module-global lazy singletons; would need reload() APIs + config-driven paths)
-- [x] Create example usage with Asterisk + Pipecat   (asterisk_ari_bridge.py provides a full working ARI + RTP bridge that feeds the skill, uses check_for_end_of_turn + acks/bleeps + end_session lifecycle)
-- [x] Prepare for open-source release (alpha)   (MIT LICENSE; requirements.txt; config.example.yaml; INSTALL.md; bootstrap + download scripts; .gitignore for config/sessions/models; README refresh. Remaining: pyproject.toml, broader GPU/CPU test matrix, CONTRIBUTING.md.)
-- [x] Provide a standard, reusable Asterisk configlet for the dialplan   (`asterisk-config/hermes.conf`: 100=Echo, 102=Milliwatt, 101=Stasis(hermes), documented in INSTALL.md)
+## Performance / Native Backend
+
+- [ ] Profile `src.media` during real calls before writing Rust.
+- [ ] If profiling shows media conversion or RMS work matters, build optional `src._media_native` with PyO3/maturin.
+- [ ] Candidate native functions:
+  - [ ] `ulaw_to_pcm16`
+  - [ ] `pcm16_to_ulaw`
+  - [ ] `upsample_8k_to_16k`
+  - [ ] `resample_pcm16`
+  - [ ] `pcm16_rms`
+- [ ] Keep the Python `src.media` implementation as fallback.
+
+## Agent / Model Flexibility
+
+- [ ] Support dynamic STT model swapping:
+  - [ ] Configurable Faster-Whisper model name.
+  - [ ] Reload API for model changes.
+  - [ ] GPU/CPU selection in config.
+- [ ] Support dynamic TTS voice swapping:
+  - [ ] Configurable Piper model path.
+  - [ ] Reload API for voice changes.
+  - [ ] Warm selected voice phrases after reload.
+- [ ] Document Hermes, Openclaw, Ollama, and OpenAI-compatible backend expectations.
+
+## Packaging / Release
+
+- [ ] Add `pyproject.toml`.
+- [ ] Add `CONTRIBUTING.md`.
+- [ ] Add a GPU/CPU validation matrix.
+- [ ] Add a short release checklist for alpha/beta tags.
+- [ ] Decide whether/when to rename the project from Pipecat Hermes Skill to an Asterisk voice-agent name.
+
+## Later
+
+- [ ] Improve sentence-level TTS interruption and resume behavior.
+- [ ] Consider streaming agent responses if the backend supports token streaming.
+- [ ] Add richer observability export, such as Prometheus or structured JSON logs.
+- [ ] Explore multiple simultaneous RTP sessions beyond the current single-port bridge design.
 
 ---
 
-*Last updated: June 2026 — Alpha pre-publish pass: INSTALL.md, requirements.txt, config.example.yaml, scripts/bootstrap.sh. Tag as v0.1.0-alpha for first GitHub push. Test on second machine (GPU) and CPU-only before beta.*
+Last updated: June 2026, after the `asterisk-voice-agent-ux-skill` streaming/media-boundary pass.
