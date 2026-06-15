@@ -34,8 +34,6 @@ The joe voice (en_US-joe-medium) is used by default for all TTS (as set in src/t
 """
 
 import argparse
-import audioop
-import io
 import logging
 import math
 import os
@@ -44,10 +42,8 @@ import random
 import socket
 import struct
 import sys
-import tempfile
 import threading
 import time
-import wave
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Optional
 
@@ -58,6 +54,8 @@ import requests
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from src.pipecat_hermes_skill import PipecatHermesSkill
 from src.config import config as skill_config
+from src import media as media_module
+from src import stt as stt_module
 from src import tts as tts_module
 from src.thinking_verbs import long_wait_phrase_pool, spinner_verb_phrases
 
@@ -67,64 +65,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger("asterisk_ari_bridge")
 
-# --- Simple ulaw <-> PCM16 helpers (Asterisk ulaw <-> 16-bit PCM) ---
-def ulaw_to_pcm16(ulaw_data: bytes) -> bytes:
-    """Convert Asterisk ulaw (8-bit) to 16-bit signed PCM."""
-    return audioop.ulaw2lin(ulaw_data, 2)
-
-def pcm16_to_ulaw(pcm16_data: bytes) -> bytes:
-    """Convert 16-bit signed PCM to Asterisk ulaw."""
-    return audioop.lin2ulaw(pcm16_data, 2)
-
-# --- Very simple 8k <-> 16k (for the skill which likes 16k for STT) ---
-def upsample_8k_to_16k(pcm8k: bytes) -> bytes:
-    """Naive upsample by repeating each sample (good enough for initial STT)."""
-    if not pcm8k:
-        return b""
-    # Each sample is 2 bytes (little-endian 16-bit)
-    return b"".join(sample * 2 for sample in (pcm8k[i:i+2] for i in range(0, len(pcm8k), 2)))
-
-def pcm16_rms(pcm16: bytes) -> float:
-    """Root-mean-square energy for 16-bit mono PCM."""
-    if not pcm16 or len(pcm16) < 2:
-        return 0.0
-    try:
-        samples = struct.unpack("<" + "h" * (len(pcm16) // 2), pcm16)
-        if not samples:
-            return 0.0
-        return (sum(s * s for s in samples) / len(samples)) ** 0.5
-    except Exception:
-        return 0.0
-
-
-def downsample_16k_to_8k(pcm16k: bytes) -> bytes:
-    """Average sample pairs (16 kHz -> 8 kHz) to reduce aliasing clicks."""
-    if not pcm16k:
-        return b""
-    out = bytearray()
-    for i in range(0, len(pcm16k) - 3, 4):
-        a = struct.unpack_from("<h", pcm16k, i)[0]
-        b = struct.unpack_from("<h", pcm16k, i + 2)[0]
-        out.extend(struct.pack("<h", (a + b) // 2))
-    return bytes(out)
-
-
-def resample_pcm16(pcm16: bytes, in_rate: int, out_rate: int = 8000) -> bytes:
-    """High-quality PCM16 resample (Piper 22050 Hz -> Asterisk 8000 Hz ulaw path)."""
-    if not pcm16 or in_rate <= 0:
-        return b""
-    if in_rate == out_rate:
-        return pcm16
-    converted, _ = audioop.ratecv(pcm16, 2, 1, in_rate, out_rate, None)
-    return converted
-
 # --- Minimal RTP helpers (for ExternalMedia ulaw audio) ---
 RTP_VERSION = 2
 RTP_PAYLOAD_ULAW = 0   # PCMU
 RTP_HEADER_SIZE = 12
-RTP_CHUNK_ULAW = 160   # 20ms @ 8kHz (matches Asterisk ptime:20)
+RTP_CHUNK_ULAW = media_module.RTP_CHUNK_ULAW   # 20ms @ 8kHz (matches Asterisk ptime:20)
 RTP_FRAME_SECONDS = 0.02
-ULAW_SILENCE = b"\xff"  # μ-law digital silence
 BLEEP_START_DELAY = 0.8   # seconds after ack before thinking ticks begin
 RTP_QUEUE_TARGET_FRAMES = 12   # ~240ms buffer — small enough to avoid long bleep tails
 BLEEP_CHUNK_SECONDS = 0.25     # slice size when looping the cached 10s bleep clip
@@ -170,9 +116,7 @@ def _configure_socket_priority(sock: socket.socket) -> None:
 
 
 def _pad_ulaw_frame(chunk: bytes) -> bytes:
-    if len(chunk) >= RTP_CHUNK_ULAW:
-        return chunk[:RTP_CHUNK_ULAW]
-    return chunk + ULAW_SILENCE * (RTP_CHUNK_ULAW - len(chunk))
+    return media_module.pad_ulaw_frame(chunk, RTP_CHUNK_ULAW)
 
 
 class RtpPlaybackPacer:
@@ -293,23 +237,6 @@ class RtpPlaybackPacer:
                     self._idle.set()
 
 
-def audio_bytes_to_ulaw(
-    audio_bytes: bytes,
-    pcm_sample_rate: int = 22050,
-) -> bytes:
-    """Convert WAV or raw PCM to 8kHz μ-law (CPU work — not on the pacer thread)."""
-    if not audio_bytes:
-        return b""
-    if audio_bytes[:4] == b"RIFF":
-        pcm, in_rate = wav_bytes_to_pcm16_and_rate(audio_bytes)
-        pcm8 = resample_pcm16(pcm, in_rate, 8000)
-    else:
-        if pcm_sample_rate == 8000:
-            pcm8 = audio_bytes
-        else:
-            pcm8 = resample_pcm16(audio_bytes, pcm_sample_rate, 8000)
-    return pcm16_to_ulaw(pcm8)
-
 class SimpleRtpSession:
     """Very small RTP sender/receiver for ulaw audio over ExternalMedia."""
 
@@ -409,25 +336,6 @@ class SimpleRtpSession:
             pass
 
 
-def wav_bytes_to_pcm16(wav_bytes: bytes) -> bytes:
-    """Extract raw PCM16 from a WAV file in memory (as produced by our TTS)."""
-    pcm, _ = wav_bytes_to_pcm16_and_rate(wav_bytes)
-    return pcm
-
-
-def wav_bytes_to_pcm16_and_rate(wav_bytes: bytes) -> tuple[bytes, int]:
-    """Extract raw PCM16 and sample rate from an in-memory WAV."""
-    try:
-        with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
-            if wf.getsampwidth() != 2 or wf.getnchannels() != 1:
-                logger.warning("Unexpected WAV format from TTS, attempting read anyway")
-            rate = wf.getframerate() or 22050
-            return wf.readframes(wf.getnframes()), rate
-    except Exception as e:
-        logger.error(f"Failed to decode WAV bytes: {e}")
-        return b"", 22050
-
-
 class AsteriskHermesBridge:
     def __init__(self, ari_url: str, ari_user: str, ari_pass: str,
                  rtp_host: str, rtp_port: int):
@@ -478,6 +386,7 @@ class AsteriskHermesBridge:
         logger.info("RTP playback pacer started (high-priority outbound audio)")
         logger.info("PipecatHermesSkill ready (using joe voice by default)")
         self._start_tts_cache_warmup()
+        self._start_stt_model_warmup()
 
     def _make_hermes_client(self):
         """Create a minimal client compatible with the skill's _send_to_hermes expectations."""
@@ -590,7 +499,7 @@ class AsteriskHermesBridge:
                 logger.warning(f"TTS cache warmup failed (lazy cache still works): {e}")
             try:
                 pcm = self.skill.warm_listening_bleeps_cache()
-                self._bleep_ulaw_cache = audio_bytes_to_ulaw(pcm, pcm_sample_rate=16000)
+                self._bleep_ulaw_cache = media_module.audio_bytes_to_ulaw(pcm, pcm_sample_rate=16000)
                 self._bleep_ulaw_offset = 0
                 logger.info(
                     f"Thinking bleep loop ready for RTP "
@@ -601,6 +510,18 @@ class AsteriskHermesBridge:
                 logger.warning(f"Bleep cache warmup failed (will render on demand): {e}")
 
         threading.Thread(target=_warm, daemon=True, name="tts-cache-warmup").start()
+
+    def _start_stt_model_warmup(self) -> None:
+        """Load Faster-Whisper in the background so the first turn is not cold."""
+        def _warm():
+            _lower_thread_priority("stt-warmup")
+            try:
+                stt_module.get_model()
+                logger.info("STT model warmed (first user turn skips model-load latency)")
+            except Exception as e:
+                logger.warning(f"STT warmup failed (lazy load will retry on first turn): {e}")
+
+        threading.Thread(target=_warm, daemon=True, name="stt-model-warmup").start()
 
     def _session_watchdog(self) -> None:
         """
@@ -647,7 +568,7 @@ class AsteriskHermesBridge:
         cache = self._bleep_ulaw_cache
         if not cache:
             pcm = self.skill.warm_listening_bleeps_cache()
-            cache = audio_bytes_to_ulaw(pcm, pcm_sample_rate=16000)
+            cache = media_module.audio_bytes_to_ulaw(pcm, pcm_sample_rate=16000)
             self._bleep_ulaw_cache = cache
             self._bleep_ulaw_offset = 0
         if not cache:
@@ -898,8 +819,8 @@ class AsteriskHermesBridge:
                 ulaw = self.rtp.receive_rtp(timeout=0.05)
                 if ulaw:
                     sess["last_rtp_at"] = time.time()
-                    pcm8 = ulaw_to_pcm16(ulaw)
-                    pcm16 = upsample_8k_to_16k(pcm8)
+                    pcm8 = media_module.ulaw_to_pcm16(ulaw)
+                    pcm16 = media_module.upsample_8k_to_16k(pcm8)
                     if self.skill.should_monitor_playback(session_id):
                         if self.skill.monitor_playback_audio(session_id, pcm16):
                             sess["playback_cancel"] = True
@@ -962,7 +883,7 @@ class AsteriskHermesBridge:
         for i in range(3200):
             sample = int(9000 * math.sin(2 * math.pi * 440 * i / 8000))
             tone.extend(struct.pack("<h", sample))
-        ulaw = pcm16_to_ulaw(bytes(tone))
+        ulaw = media_module.pcm16_to_ulaw(bytes(tone))
 
         echo_rms_readings: list[float] = []
         packets = 0
@@ -976,9 +897,9 @@ class AsteriskHermesBridge:
             for _ in range(2):
                 inbound = self.rtp.receive_rtp(timeout=0.03)
                 if inbound:
-                    pcm8 = ulaw_to_pcm16(inbound)
-                    pcm16 = upsample_8k_to_16k(pcm8)
-                    rms = pcm16_rms(pcm16)
+                    pcm8 = media_module.ulaw_to_pcm16(inbound)
+                    pcm16 = media_module.upsample_8k_to_16k(pcm8)
+                    rms = media_module.pcm16_rms(pcm16)
                     if rms > 0:
                         echo_rms_readings.append(rms)
 
@@ -1051,10 +972,12 @@ class AsteriskHermesBridge:
                         return
                     with self.skill._lock:
                         self.skill.last_response_audio_by_session.pop(session_id, None)
+                        self.skill.last_response_text_by_session.pop(session_id, None)
                     self.skill.route_message(
                         session_id,
                         text,
                         alive_check=lambda: self._is_session_active(session_id),
+                        synthesize_audio=False,
                     )
                 except Exception as e:
                     logger.exception(f"[{session_id}] Hermes worker failed: {e}")
@@ -1084,22 +1007,25 @@ class AsteriskHermesBridge:
                     )
 
                 with self.skill._lock:
+                    response_text = self.skill.last_response_text_by_session.get(session_id)
                     full_wav = self.skill.last_response_audio_by_session.get(session_id)
-                if full_wav and not sess.get("playback_cancel"):
+                if response_text and not sess.get("playback_cancel"):
+                    self._play_tts_text_streaming(
+                        rtp,
+                        response_text,
+                        session_id,
+                        sess,
+                        label="response",
+                    )
+                elif full_wav and not sess.get("playback_cancel"):
                     self._play_audio_bytes(rtp, full_wav, session_id, sess, label="response")
                 elif not sess.get("playback_cancel"):
                     logger.warning(f"[{session_id}] No response audio, synthesizing fallback")
                     try:
-                        fd, tmp = tempfile.mkstemp(suffix=".wav")
-                        os.close(fd)
-                        tts_module.synthesize(
+                        fallback = tts_module.synthesize_to_wav_bytes(
                             text or "Sorry, I didn't catch that.",
-                            tmp,
                             use_cache=False,
                         )
-                        with open(tmp, "rb") as f:
-                            fallback = f.read()
-                        os.unlink(tmp)
                         self._play_audio_bytes(rtp, fallback, session_id, sess, label="fallback")
                     except Exception as e:
                         logger.error(f"Fallback TTS failed: {e}")
@@ -1227,7 +1153,7 @@ class AsteriskHermesBridge:
             return
 
         try:
-            ulaw = audio_bytes_to_ulaw(audio_bytes, pcm_sample_rate=pcm_sample_rate)
+            ulaw = media_module.audio_bytes_to_ulaw(audio_bytes, pcm_sample_rate=pcm_sample_rate)
             if not ulaw:
                 logger.warning(f"[{session_id}] No ulaw audio to play for {label}")
                 return
@@ -1252,6 +1178,64 @@ class AsteriskHermesBridge:
                 )
         except Exception as e:
             logger.exception(f"[{session_id}] Error playing {label} audio: {e}")
+
+    def _play_tts_text_streaming(
+        self,
+        rtp: SimpleRtpSession,
+        text: str,
+        session_id: str,
+        sess: dict,
+        label: str = "tts",
+    ) -> bool:
+        """Stream Piper PCM chunks through the RTP pacer as they are produced."""
+        if not text or sess.get("playback_cancel"):
+            return False
+
+        stop = lambda: sess.get("playback_cancel") or not sess.get("running")
+        max_queue_depth = max(RTP_QUEUE_TARGET_FRAMES * 6, 48)
+        frames_queued = 0
+        started = False
+
+        try:
+            for pcm16, sample_rate in tts_module.iter_synthesize_pcm16_chunks(text):
+                if stop():
+                    self.playback.flush()
+                    return False
+                ulaw = media_module.pcm16_to_ulaw_bytes(
+                    pcm16,
+                    sample_rate=sample_rate,
+                    out_rate=8000,
+                )
+                if not ulaw:
+                    continue
+
+                while self.playback.queue_depth() > max_queue_depth:
+                    if stop():
+                        self.playback.flush()
+                        return False
+                    time.sleep(0.01)
+
+                frames_queued += self.playback.enqueue(ulaw, marker=not started)
+                started = True
+
+            if not started:
+                logger.warning(f"[{session_id}] Streaming TTS produced no audio for {label}")
+                return False
+
+            timeout = max(5.0, frames_queued * RTP_FRAME_SECONDS + 2.0)
+            self.playback.wait_until_idle(timeout=timeout)
+            if stop():
+                self.playback.flush()
+                return False
+
+            logger.info(
+                f"[{session_id}] Played streaming {label}: "
+                f"{frames_queued} RTP packets -> {rtp.remote_addr}"
+            )
+            return True
+        except Exception as e:
+            logger.exception(f"[{session_id}] Error streaming {label} TTS: {e}")
+            return False
 
 
 def main():

@@ -10,14 +10,11 @@ The goal is to provide a clean interface between Hermes and Pipecat.
 
 import logging
 import math
-import os
 import random
 import re
 import struct
-import tempfile
 import threading
 import time
-import wave
 from typing import Callable, Optional, List
 
 from . import config as config_module
@@ -96,6 +93,7 @@ class PipecatHermesSkill:
         # Audio chunk buffers per session (raw bytes, assumed consistent PCM format)
         # Format assumption: 16kHz, 16-bit, mono by default (common for Whisper/Piper)
         self.audio_buffers: dict[str, list[bytes]] = {}
+        self.audio_buffer_bytes: dict[str, int] = {}
         self.last_audio_time: dict[str, float] = {}
 
         # Interruption / barge-in state
@@ -104,6 +102,7 @@ class PipecatHermesSkill:
         self.processing_turn: dict[str, bool] = {}
         # Per-session synthesized response audio (bridge reads this instead of a global)
         self.last_response_audio_by_session: dict[str, bytes] = {}
+        self.last_response_text_by_session: dict[str, str] = {}
         self.last_assistant_response: dict[str, str] = {}
 
         # Whether we have recently seen speech energy for this session.
@@ -257,14 +256,16 @@ class PipecatHermesSkill:
 
             if session_id not in self.audio_buffers:
                 self.audio_buffers[session_id] = []
+                self.audio_buffer_bytes[session_id] = 0
                 self.speech_active[session_id] = False
             self.audio_buffers[session_id].append(audio_chunk)
+            total_buf = self.audio_buffer_bytes.get(session_id, 0) + len(audio_chunk)
+            self.audio_buffer_bytes[session_id] = total_buf
 
             has_energy = self._chunk_has_speech_energy(audio_chunk)
             if has_energy:
                 self.last_audio_time[session_id] = time.time()
                 self.speech_active[session_id] = True
-                total_buf = sum(len(c) for c in self.audio_buffers[session_id])
                 # Log energy only occasionally to avoid spam during long speech
                 if total_buf % 16000 < 320:  # roughly every ~1s of audio
                     logger.info(f"[{session_id}] Energy detected, buffer ~{total_buf} bytes")
@@ -276,6 +277,7 @@ class PipecatHermesSkill:
             self.turn_detect_after[session_id] = now + self.session_start_grace
             self.mic_unmute_after[session_id] = now + self.session_start_grace
             self.audio_buffers.pop(session_id, None)
+            self.audio_buffer_bytes.pop(session_id, None)
             self.last_audio_time.pop(session_id, None)
             self.speech_active[session_id] = False
             self.acoustic_mode[session_id] = "speakerphone"
@@ -368,6 +370,7 @@ class PipecatHermesSkill:
             self._interrupt_monitor_buffers.pop(session_id, None)
             self._interrupt_last_check.pop(session_id, None)
             self.audio_buffers.pop(session_id, None)
+            self.audio_buffer_bytes.pop(session_id, None)
             self.last_audio_time.pop(session_id, None)
             self.speech_active[session_id] = False
         logger.info(f"[{session_id}] Playback interrupted by keyword — listening for your turn")
@@ -383,6 +386,7 @@ class PipecatHermesSkill:
             self.agent_playback_active[session_id] = True
             self.is_speaking[session_id] = True
             self.audio_buffers.pop(session_id, None)
+            self.audio_buffer_bytes.pop(session_id, None)
             self.last_audio_time.pop(session_id, None)
             self.speech_active[session_id] = False
             self._interrupt_monitor_buffers.pop(session_id, None)
@@ -400,6 +404,7 @@ class PipecatHermesSkill:
                 unmute_at,
             )
             self.audio_buffers.pop(session_id, None)
+            self.audio_buffer_bytes.pop(session_id, None)
             self.last_audio_time.pop(session_id, None)
             self.speech_active[session_id] = False
 
@@ -426,10 +431,10 @@ class PipecatHermesSkill:
         """Very lightweight energy detector for 16-bit PCM."""
         if not chunk or len(chunk) < 2:
             return False
-        # Treat as signed 16-bit little-endian samples
+        # Treat as signed 16-bit samples without building a large unpacked tuple.
         try:
-            # Sample a few values for speed
-            samples = struct.unpack("<" + "h" * (len(chunk) // 2), chunk[: min(len(chunk), 2000)])
+            sample_bytes = min(len(chunk), 2000) & ~1
+            samples = memoryview(chunk[:sample_bytes]).cast("h")
             if not samples:
                 return False
             rms = (sum(s * s for s in samples) / len(samples)) ** 0.5
@@ -561,7 +566,9 @@ class PipecatHermesSkill:
                 return None
             silence = time.time() - last_audio
 
-            total_buf = sum(len(c) for c in buffer)
+            total_buf = self.audio_buffer_bytes.get(session_id)
+            if total_buf is None:
+                total_buf = sum(len(c) for c in buffer)
             logger.debug(
                 f"[{session_id}] check_for_end_of_turn: silence={silence:.2f}s "
                 f"active={self.speech_active.get(session_id, False)} buffer={total_buf} bytes"
@@ -581,8 +588,7 @@ class PipecatHermesSkill:
                 # Require a minimum amount of audio in the buffer before declaring
                 # a long-pause turn. This avoids processing 20ms fragments when
                 # energy detection has gaps.
-                total_bytes = sum(len(c) for c in buffer)
-                if total_bytes < self.min_turn_bytes:
+                if total_buf < self.min_turn_bytes:
                     return None
                 logger.debug(f"Long pause ({silence:.2f}s) for session {session_id} → ending turn")
                 self.speech_active[session_id] = False
@@ -595,13 +601,13 @@ class PipecatHermesSkill:
                 text = self._transcribe_buffer(current_buffer_copy)
 
                 if text and self._text_has_turn_cue(text) and self._is_meaningful_transcript(text):
-                    total_bytes = sum(len(c) for c in buffer)
-                    if total_bytes < self.min_turn_bytes:
+                    if total_buf < self.min_turn_bytes:
                         return None
                     logger.debug(
                         f"Turn cue + short pause ({silence:.2f}s) for session {session_id} → ending turn early"
                     )
                     self.audio_buffers.pop(session_id, None)
+                    self.audio_buffer_bytes.pop(session_id, None)
                     self.speech_active[session_id] = False
                     self.processing_turn[session_id] = True
                     self._metrics["turns_processed"] = self._metrics.get("turns_processed", 0) + 1
@@ -622,36 +628,14 @@ class PipecatHermesSkill:
         if not buffer:
             return None
 
-        wav_path = None
         try:
-            fd, wav_path = tempfile.mkstemp(suffix=".wav")
-            os.close(fd)
-
-            # Assumptions: 16 kHz, mono, 16-bit PCM (should match the transport)
-            sample_rate = 16000
-            channels = 1
-            sample_width = 2
-
-            with wave.open(wav_path, "wb") as wf:
-                wf.setnchannels(channels)
-                wf.setsampwidth(sample_width)
-                wf.setframerate(sample_rate)
-                for chunk in buffer:
-                    wf.writeframes(chunk)
-
-            text = stt_module.transcribe(wav_path)
+            text = stt_module.transcribe_pcm16(b"".join(buffer), sample_rate=16000)
             logger.debug(f"STT result: {text!r}")
             return text.strip() if text else None
 
         except Exception as e:
             handle_error(e, "buffer transcription", session_id=None)
             return None
-        finally:
-            if wav_path and os.path.exists(wav_path):
-                try:
-                    os.unlink(wav_path)
-                except Exception:
-                    pass
 
     # --- Interruption / Barge-in handling (high-priority TODO item) ---
 
@@ -932,11 +916,13 @@ class PipecatHermesSkill:
         with self._lock:
             # Clean transient state
             self.audio_buffers.pop(session_id, None)
+            self.audio_buffer_bytes.pop(session_id, None)
             self.last_audio_time.pop(session_id, None)
             self.is_speaking.pop(session_id, None)
             self.processing_turn.pop(session_id, None)
             self.last_assistant_response.pop(session_id, None)
             self.last_response_audio_by_session.pop(session_id, None)
+            self.last_response_text_by_session.pop(session_id, None)
             self.speech_active.pop(session_id, None)
             self.agent_playback_active.pop(session_id, None)
             self.mic_unmute_after.pop(session_id, None)
@@ -968,11 +954,13 @@ class PipecatHermesSkill:
         with self._lock:
             for sid in expired_ids:
                 self.audio_buffers.pop(sid, None)
+                self.audio_buffer_bytes.pop(sid, None)
                 self.last_audio_time.pop(sid, None)
                 self.is_speaking.pop(sid, None)
                 self.processing_turn.pop(sid, None)
                 self.last_assistant_response.pop(sid, None)
                 self.last_response_audio_by_session.pop(sid, None)
+                self.last_response_text_by_session.pop(sid, None)
                 self.speech_active.pop(sid, None)
                 self.agent_playback_active.pop(sid, None)
                 self.mic_unmute_after.pop(sid, None)
@@ -1008,6 +996,7 @@ class PipecatHermesSkill:
                 time.time() + self._playback_cooldown(session_id)
             )
             self.audio_buffers.pop(session_id, None)
+            self.audio_buffer_bytes.pop(session_id, None)
             self.last_audio_time.pop(session_id, None)
             self.speech_active[session_id] = False
 
@@ -1023,6 +1012,7 @@ class PipecatHermesSkill:
             if self.is_speaking.get(session_id) or self.processing_turn.get(session_id):
                 return None
             buffer = self.audio_buffers.pop(session_id, [])
+            self.audio_buffer_bytes.pop(session_id, None)
             if not buffer:
                 return None
             self.processing_turn[session_id] = True
@@ -1054,7 +1044,8 @@ class PipecatHermesSkill:
         session_id: str,
         message: str,
         alive_check: Optional[Callable[[], bool]] = None,
-    ):
+        synthesize_audio: bool = True,
+    ) -> Optional[str]:
         """
         Routes an incoming (transcribed) message to Hermes and handles the response.
 
@@ -1106,36 +1097,32 @@ class PipecatHermesSkill:
         # Persist the updated conversation state (history + activity timestamp)
         self.session_manager.update_and_persist(session)
 
+        with self._lock:
+            self.last_assistant_response[session_id] = response
+            self.last_response_text_by_session[session_id] = response
+
+        if not synthesize_audio:
+            self.last_response_text = response
+            self.last_response_audio = None
+            return response
+
         if alive_check and not alive_check():
             logger.info(f"Skipping TTS for {session_id} — call ended before synthesis")
             return
 
         # Synthesize response to audio using local TTS
         audio_bytes: Optional[bytes] = None
-        tts_path = None
         try:
-            fd, tts_path = tempfile.mkstemp(suffix=".wav")
-            os.close(fd)
-            tts_module.synthesize(response, tts_path, use_cache=False)
+            audio_bytes = tts_module.synthesize_to_wav_bytes(response, use_cache=False)
 
             if alive_check and not alive_check():
                 logger.info(f"Discarding TTS for {session_id} — call ended during synthesis")
                 return
 
-            with open(tts_path, "rb") as f:
-                audio_bytes = f.read()
-
             logger.debug(f"TTS generated for session {session_id}, {len(audio_bytes)} bytes")
             self._metrics["tts_syntheses"] = self._metrics.get("tts_syntheses", 0) + 1
         except Exception as e:
             handle_error(e, "TTS synthesis", session_id=session_id)
-        finally:
-            if tts_path and os.path.exists(tts_path):
-                try:
-                    os.unlink(tts_path)
-                except Exception:
-                    pass
-
         # Deliver audio back through the pipeline/transport if available
         if audio_bytes and self.pipeline is not None:
             try:
@@ -1156,6 +1143,7 @@ class PipecatHermesSkill:
                 self.last_response_audio_by_session[session_id] = audio_bytes
             # Discard any audio captured during synthesis; playback gating is now active.
             self.audio_buffers.pop(session_id, None)
+            self.audio_buffer_bytes.pop(session_id, None)
             self.last_audio_time.pop(session_id, None)
             self.speech_active[session_id] = False
 
@@ -1163,6 +1151,7 @@ class PipecatHermesSkill:
         # (simple attribute for now)
         self.last_response_text = response
         self.last_response_audio = audio_bytes
+        return response
 
     def _send_to_hermes(self, message: str, history: Optional[list] = None) -> str:
         """
