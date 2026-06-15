@@ -19,6 +19,7 @@ from typing import Callable, Optional, List
 
 from . import config as config_module
 from . import stt as stt_module
+from . import telemetry
 from . import tts as tts_module
 from .thinking_verbs import long_wait_phrase_pool
 from .error_handler import handle_error, get_user_friendly_message
@@ -88,6 +89,9 @@ class PipecatHermesSkill:
             "hermes_errors": 0,
             "tts_syntheses": 0,
             "last_route_latency_ms": None,
+            "last_agent_latency_ms": None,
+            "last_stt_latency_ms": None,
+            "last_stt_audio_ms": None,
         }
 
         # Audio chunk buffers per session (raw bytes, assumed consistent PCM format)
@@ -205,7 +209,7 @@ class PipecatHermesSkill:
                 logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
             logger.setLevel(level)
             # Also ensure child loggers from stt/tts/error_handler propagate at this level
-            for mod_name in ("src.stt", "src.tts", "src.error_handler"):
+            for mod_name in ("src.stt", "src.tts", "src.error_handler", "perf"):
                 logging.getLogger(mod_name).setLevel(level)
         except Exception as exc:
             # Never let logging config break the skill
@@ -344,7 +348,11 @@ class PipecatHermesSkill:
             snapshot = list(buf)
             self._interrupt_monitor_buffers[session_id] = []
 
-        text = self._transcribe_buffer(snapshot)
+        text = self._transcribe_buffer(
+            snapshot,
+            session_id=session_id,
+            reason="interrupt-monitor",
+        )
         if not text:
             return False
         if self.interrupt_keywords.search(text):
@@ -598,7 +606,11 @@ class PipecatHermesSkill:
             if silence >= self.short_pause_after_cue_threshold:
                 # Peek at what the current audio sounds like (transcribe without committing)
                 current_buffer_copy = list(buffer)
-                text = self._transcribe_buffer(current_buffer_copy)
+                text = self._transcribe_buffer(
+                    current_buffer_copy,
+                    session_id=session_id,
+                    reason="turn-cue-peek",
+                )
 
                 if text and self._text_has_turn_cue(text) and self._is_meaningful_transcript(text):
                     if total_buf < self.min_turn_bytes:
@@ -619,7 +631,12 @@ class PipecatHermesSkill:
 
             return None
 
-    def _transcribe_buffer(self, buffer: list[bytes]) -> Optional[str]:
+    def _transcribe_buffer(
+        self,
+        buffer: list[bytes],
+        session_id: Optional[str] = None,
+        reason: str = "turn",
+    ) -> Optional[str]:
         """
         Core transcription helper. Writes the given PCM chunks to a temp WAV
         and runs the local STT model. Returns the text or None on failure.
@@ -628,14 +645,42 @@ class PipecatHermesSkill:
         if not buffer:
             return None
 
+        pcm = b"".join(buffer)
+        audio_ms = int(round((len(pcm) / 2) / 16000 * 1000)) if pcm else 0
+        started = telemetry.now()
+        transcript_chars = 0
+        ok = False
+        error_type: Optional[str] = None
+
         try:
-            text = stt_module.transcribe_pcm16(b"".join(buffer), sample_rate=16000)
+            text = stt_module.transcribe_pcm16(pcm, sample_rate=16000)
+            cleaned = text.strip() if text else None
+            transcript_chars = len(cleaned or "")
+            ok = True
             logger.debug(f"STT result: {text!r}")
-            return text.strip() if text else None
+            return cleaned
 
         except Exception as e:
-            handle_error(e, "buffer transcription", session_id=None)
+            error_type = type(e).__name__
+            handle_error(e, "buffer transcription", session_id=session_id)
             return None
+        finally:
+            latency_ms = telemetry.elapsed_ms(started)
+            with self._lock:
+                self._metrics["last_stt_latency_ms"] = latency_ms
+                self._metrics["last_stt_audio_ms"] = audio_ms
+            fields = {
+                "reason": reason,
+                "elapsed_ms": latency_ms,
+                "audio_ms": audio_ms,
+                "audio_bytes": len(pcm),
+                "chunks": len(buffer),
+                "transcript_chars": transcript_chars,
+                "ok": ok,
+            }
+            if error_type:
+                fields["error_type"] = error_type
+            telemetry.log_event("stt.transcribe", session_id=session_id, **fields)
 
     # --- Interruption / Barge-in handling (high-priority TODO item) ---
 
@@ -1018,7 +1063,11 @@ class PipecatHermesSkill:
             self.processing_turn[session_id] = True
             self.speech_active[session_id] = False
 
-        text = self._transcribe_buffer(buffer)
+        text = self._transcribe_buffer(
+            buffer,
+            session_id=session_id,
+            reason="turn-commit",
+        )
 
         if text and self._is_meaningful_transcript(text):
             logger.info(f"Processed audio turn for session {session_id} ({len(text)} chars)")
@@ -1067,26 +1116,46 @@ class PipecatHermesSkill:
         session = self.session_manager.get_or_create(session_id)
         session["history"].append({"role": "user", "content": message})
 
-        start = time.time()
+        start = telemetry.now()
+        agent_ok = False
+        error_type: Optional[str] = None
         try:
             response = self._send_to_hermes(message, history=list(session["history"]))
+            agent_ok = True
             self._metrics["hermes_calls"] = self._metrics.get("hermes_calls", 0) + 1
         except Exception as e:
+            error_type = type(e).__name__
             handle_error(e, "routing message", session_id=session_id)
             self._metrics["hermes_errors"] = self._metrics.get("hermes_errors", 0) + 1
             response = get_user_friendly_message(e, "contacting the agent")
+
+        latency_ms = telemetry.elapsed_ms(start)
+        with self._lock:
+            self._metrics["last_route_latency_ms"] = latency_ms
+            self._metrics["last_agent_latency_ms"] = latency_ms
+
+        if not response:
+            response = "I don't have a response right now."
+
+        perf_fields = {
+            "elapsed_ms": latency_ms,
+            "ok": agent_ok,
+            "backend": getattr(self.config.hermes, "backend", "unknown"),
+            "model": getattr(self.config.hermes, "model", "unknown"),
+            "message_chars": len(message or ""),
+            "history_messages": len(session["history"]),
+            "response_chars": len(response or ""),
+            "synthesize_audio": synthesize_audio,
+        }
+        if error_type:
+            perf_fields["error_type"] = error_type
+        telemetry.log_event("agent.request", session_id=session_id, **perf_fields)
 
         if alive_check and not alive_check():
             logger.info(
                 f"Discarding Hermes response for {session_id} — call ended during request"
             )
             return
-
-        latency_ms = int((time.time() - start) * 1000)
-        self._metrics["last_route_latency_ms"] = latency_ms
-
-        if not response:
-            response = "I don't have a response right now."
 
         logger.info(
             f"Hermes response for session {session_id} ({latency_ms}ms): "
