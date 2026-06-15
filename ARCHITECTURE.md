@@ -23,6 +23,7 @@ conversion module that can later be replaced by an optional native/Rust backend.
 
 ```text
 SIP phone
+  -> Asterisk DTMF PIN gate
   -> Asterisk Stasis / ExternalMedia
   -> asterisk_ari_bridge.py
   -> src.media              (PCM/u-law/resampling/RTP frame helpers)
@@ -40,6 +41,10 @@ Incoming Asterisk RTP is decoded to PCM16, upsampled to 16 kHz for STT, routed
 through the agent, then TTS output is converted back to 8 kHz PCMU/u-law for RTP
 playback.
 
+Extension `101` is protected in Asterisk before `Stasis(hermes)` runs. The
+DTMF PIN is configured as `HERMES_AGENT_PIN` in the Asterisk dialplan, so failed
+or unauthenticated callers do not reach ARI, RTP bridging, STT, or the agent.
+
 ## 3. Main Layers
 
 ### Asterisk Bridge
@@ -56,6 +61,9 @@ Responsibilities:
 - Pace outbound RTP on a dedicated sender thread.
 - Run background warmups for STT and fixed TTS phrases.
 - Reap stuck sessions with a watchdog.
+
+The Asterisk dialplan performs the DTMF PIN challenge before this bridge sees
+the call. This keeps caller authentication outside the Python process.
 
 The bridge is intentionally transport-specific. It knows about ARI, RTP, PCMU,
 ports, channels, bridges, and call lifecycle.
@@ -148,13 +156,14 @@ because it is transient and timing-sensitive.
 
 ### Caller Turn
 
-1. Asterisk sends PCMU RTP to the bridge.
-2. `src.media.ulaw_to_pcm16()` decodes 8 kHz PCMU to PCM16.
-3. `src.media.upsample_8k_to_16k()` prepares audio for STT.
-4. `PipecatHermesSkill.handle_incoming_audio()` buffers PCM and tracks energy.
-5. `check_for_end_of_turn()` detects long pause or short pause after a cue.
-6. `process_audio_turn()` calls `stt.transcribe_pcm16()`.
-7. The bridge plays a short acknowledgement and thinking bleeps while the agent
+1. Asterisk requires the caller to pass the DTMF PIN gate.
+2. Asterisk sends PCMU RTP to the bridge.
+3. `src.media.ulaw_to_pcm16()` decodes 8 kHz PCMU to PCM16.
+4. `src.media.upsample_8k_to_16k()` prepares audio for STT.
+5. `PipecatHermesSkill.handle_incoming_audio()` buffers PCM and tracks energy.
+6. `check_for_end_of_turn()` detects long pause or short pause after a cue.
+7. `process_audio_turn()` calls `stt.transcribe_pcm16()`.
+8. The bridge plays a short acknowledgement and thinking bleeps while the agent
    request runs.
 
 ### Agent Response
@@ -210,6 +219,7 @@ Current lightweight tests:
 - `tests/test_session_manager.py`
 - `tests/test_turn_cues.py`
 - `tests/test_media.py`
+- `tests/test_telemetry.py`
 
 These avoid loading STT/TTS models, so they can run quickly in development:
 
@@ -230,6 +240,7 @@ Live validation still requires the actual Asterisk/Hermes environment.
 | Media module | Working Python fallback | Optional `src._media_native` hook prepared |
 | Session manager | Working | Optional JSON persistence and timeout cleanup |
 | Agent client | Working | Hermes/OpenAI/Ollama-style HTTP support |
+| Performance telemetry | Working | Structured `perf` logs for STT, agent, TTS, and RTP pacing |
 | Tests | Good lightweight coverage | Session, turn cue, and media tests |
 | Live performance validation | Next step | Needs real Asterisk/Hermes call testing |
 
@@ -237,10 +248,9 @@ Live validation still requires the actual Asterisk/Hermes environment.
 
 1. Merge `asterisk-voice-agent-ux-skill` into `main`.
 2. Run live-call validation on the target machine.
-3. Add timing instrumentation for STT, agent latency, first TTS chunk, total TTS,
-   RTP queue depth, and underruns.
-4. Use those measurements to decide whether `src._media_native` is worth building.
-5. Update README/repo naming to better express the Asterisk voice-agent UX role.
+3. Use timing measurements to decide whether `src._media_native` is worth building.
+4. Update README/repo naming to better express the Asterisk voice-agent UX role.
+5. Add optional caller-ID allowlist/rate-limit policy after PIN behavior is validated.
 
 ## 10. Open Questions
 

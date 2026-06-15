@@ -56,6 +56,7 @@ from src.pipecat_hermes_skill import PipecatHermesSkill
 from src.config import config as skill_config
 from src import media as media_module
 from src import stt as stt_module
+from src import telemetry
 from src import tts as tts_module
 from src.thinking_verbs import long_wait_phrase_pool, spinner_verb_phrases
 
@@ -133,6 +134,12 @@ class RtpPlaybackPacer:
         self._idle.set()
         self._pending = 0
         self._pending_lock = threading.Lock()
+        self._stats_lock = threading.Lock()
+        self._frames_sent = 0
+        self._underruns = 0
+        self._resyncs = 0
+        self._high_watermark = 0
+        self._last_resync_log = 0.0
         self._thread = threading.Thread(
             target=self._run, name="rtp-pacer", daemon=True
         )
@@ -140,6 +147,23 @@ class RtpPlaybackPacer:
 
     def queue_depth(self) -> int:
         return self._q.qsize()
+
+    def pending_frames(self) -> int:
+        with self._pending_lock:
+            return self._pending
+
+    def stats(self) -> dict:
+        with self._pending_lock:
+            pending = self._pending
+        with self._stats_lock:
+            return {
+                "queue_depth": self._q.qsize(),
+                "pending_frames": pending,
+                "frames_sent": self._frames_sent,
+                "underruns": self._underruns,
+                "resyncs": self._resyncs,
+                "high_watermark": self._high_watermark,
+            }
 
     def flush(self) -> None:
         """Drop queued audio immediately (barge-in / cancel)."""
@@ -152,7 +176,13 @@ class RtpPlaybackPacer:
                 break
         self._idle.set()
 
-    def enqueue(self, ulaw: bytes, marker: bool = False) -> int:
+    def enqueue(
+        self,
+        ulaw: bytes,
+        marker: bool = False,
+        session_id: Optional[str] = None,
+        label: str = "",
+    ) -> int:
         """Queue ulaw audio; returns number of 20ms frames queued."""
         if not ulaw:
             return 0
@@ -166,9 +196,12 @@ class RtpPlaybackPacer:
         first = True
         for i in range(0, len(ulaw), RTP_CHUNK_ULAW):
             chunk = _pad_ulaw_frame(ulaw[i:i + RTP_CHUNK_ULAW])
-            self._q.put((chunk, marker and first))
+            self._q.put((chunk, marker and first, session_id, label))
             frames += 1
             first = False
+            depth = self._q.qsize()
+            with self._stats_lock:
+                self._high_watermark = max(self._high_watermark, depth)
         return frames
 
     def play_blocking(
@@ -176,9 +209,16 @@ class RtpPlaybackPacer:
         ulaw: bytes,
         marker: bool = False,
         should_stop: Optional[Callable[[], bool]] = None,
+        session_id: Optional[str] = None,
+        label: str = "",
     ) -> bool:
         """Queue audio and block until every frame is sent (or flush/cancel)."""
-        frames = self.enqueue(ulaw, marker=marker)
+        frames = self.enqueue(
+            ulaw,
+            marker=marker,
+            session_id=session_id,
+            label=label,
+        )
         if frames == 0:
             return True
         while True:
@@ -197,6 +237,24 @@ class RtpPlaybackPacer:
         self._stop.set()
         self._q.put(None)
         self._thread.join(timeout=2.0)
+
+    def _record_resync(self, late_ms: int, session_id: Optional[str], label: str) -> None:
+        with self._stats_lock:
+            self._underruns += 1
+            self._resyncs += 1
+            now = time.monotonic()
+            should_log = now - self._last_resync_log >= 1.0
+            if should_log:
+                self._last_resync_log = now
+        if should_log:
+            telemetry.log_event(
+                "rtp.underrun",
+                session_id=session_id,
+                label=label,
+                late_ms=late_ms,
+                queue_depth=self.queue_depth(),
+                pending_frames=self.pending_frames(),
+            )
 
     def _run(self) -> None:
         _boost_thread_priority("rtp-pacer")
@@ -218,7 +276,7 @@ class RtpPlaybackPacer:
             if item is None:
                 break
 
-            chunk, marker = item
+            chunk, marker, item_session_id, item_label = item
             now = time.monotonic()
             if next_deadline is None:
                 next_deadline = now
@@ -226,9 +284,16 @@ class RtpPlaybackPacer:
                 time.sleep(next_deadline - now)
             elif now - next_deadline > 0.06:
                 # Fell behind — resync rather than burst (bursting sounds choppy).
+                self._record_resync(
+                    int(round((now - next_deadline) * 1000)),
+                    item_session_id,
+                    item_label,
+                )
                 next_deadline = now
 
-            self._rtp.send_ulaw(chunk, marker=marker)
+            if self._rtp.send_ulaw(chunk, marker=marker):
+                with self._stats_lock:
+                    self._frames_sent += 1
             next_deadline += RTP_FRAME_SECONDS
 
             with self._pending_lock:
@@ -563,7 +628,11 @@ class AsteriskHermesBridge:
                     )
                     self._stop_session(session_id)
 
-    def _enqueue_cached_bleeps(self, marker: bool = False) -> bool:
+    def _enqueue_cached_bleeps(
+        self,
+        session_id: Optional[str] = None,
+        marker: bool = False,
+    ) -> bool:
         """Enqueue the next slice from the cached 10s thinking-bleep loop."""
         cache = self._bleep_ulaw_cache
         if not cache:
@@ -588,7 +657,12 @@ class AsteriskHermesBridge:
             chunk = cache[start:] + cache[:wrap]
 
         self._bleep_ulaw_offset = end % len(cache)
-        self.playback.enqueue(chunk, marker=marker)
+        self.playback.enqueue(
+            chunk,
+            marker=marker,
+            session_id=session_id,
+            label="thinking-bleep",
+        )
         return True
 
     def start(self):
@@ -843,6 +917,12 @@ class AsteriskHermesBridge:
                 if text:
                     sess["turn_worker_running"] = True
                     sess["turn_started_at"] = time.time()
+                    telemetry.log_event(
+                        "turn.accepted",
+                        session_id=session_id,
+                        transcript_chars=len(text),
+                        rtp_queue_depth=self.playback.queue_depth(),
+                    )
                     threading.Thread(
                         target=self._handle_turn_end,
                         args=(session_id, text),
@@ -1130,7 +1210,10 @@ class AsteriskHermesBridge:
                 and not sess.get("playback_cancel")
                 and not done.is_set()
             ):
-                if not self._enqueue_cached_bleeps(marker=bleep_marker):
+                if not self._enqueue_cached_bleeps(
+                    session_id=session_id,
+                    marker=bleep_marker,
+                ):
                     break
                 bleep_marker = False
 
@@ -1152,19 +1235,32 @@ class AsteriskHermesBridge:
         if not audio_bytes or sess.get("playback_cancel"):
             return
 
+        stats_before = self.playback.stats()
+        ulaw = b""
+        packets_sent = 0
+        convert_ms = 0
+        playback_ms = 0
+        ok = False
+        error_type: Optional[str] = None
         try:
+            convert_started = telemetry.now()
             ulaw = media_module.audio_bytes_to_ulaw(audio_bytes, pcm_sample_rate=pcm_sample_rate)
+            convert_ms = telemetry.elapsed_ms(convert_started)
             if not ulaw:
                 logger.warning(f"[{session_id}] No ulaw audio to play for {label}")
                 return
 
+            packets_sent = (len(ulaw) + RTP_CHUNK_ULAW - 1) // RTP_CHUNK_ULAW
+            playback_started = telemetry.now()
             ok = self.playback.play_blocking(
                 ulaw,
                 marker=True,
                 should_stop=lambda: sess.get("playback_cancel") or not sess.get("running"),
+                session_id=session_id,
+                label=label,
             )
+            playback_ms = telemetry.elapsed_ms(playback_started)
             if ok:
-                packets_sent = (len(ulaw) + RTP_CHUNK_ULAW - 1) // RTP_CHUNK_ULAW
                 logger.info(
                     f"[{session_id}] Played {label}: {packets_sent} RTP packets "
                     f"({len(ulaw)} ulaw bytes) -> {rtp.remote_addr}"
@@ -1177,7 +1273,29 @@ class AsteriskHermesBridge:
                     f"(remote_addr={rtp.remote_addr})"
                 )
         except Exception as e:
+            error_type = type(e).__name__
             logger.exception(f"[{session_id}] Error playing {label} audio: {e}")
+        finally:
+            stats_after = self.playback.stats()
+            fields = {
+                "label": label,
+                "ok": ok,
+                "frames_queued": packets_sent,
+                "ulaw_bytes": len(ulaw),
+                "convert_ms": convert_ms,
+                "playback_ms": playback_ms,
+                "queue_depth_before": stats_before.get("queue_depth", 0),
+                "queue_depth_after": stats_after.get("queue_depth", 0),
+                "queue_high_watermark": stats_after.get("high_watermark", 0),
+                "underruns_delta": stats_after.get("underruns", 0)
+                - stats_before.get("underruns", 0),
+                "resyncs_delta": stats_after.get("resyncs", 0)
+                - stats_before.get("resyncs", 0),
+                "has_remote_peer": rtp.remote_addr is not None,
+            }
+            if error_type:
+                fields["error_type"] = error_type
+            telemetry.log_event("rtp.playback", session_id=session_id, **fields)
 
     def _play_tts_text_streaming(
         self,
@@ -1193,14 +1311,59 @@ class AsteriskHermesBridge:
 
         stop = lambda: sess.get("playback_cancel") or not sess.get("running")
         max_queue_depth = max(RTP_QUEUE_TARGET_FRAMES * 6, 48)
+        stats_before = self.playback.stats()
+        tts_started = telemetry.now()
+        first_pcm_ms: Optional[int] = None
+        total_generation_ms: Optional[int] = None
+        playback_wait_ms = 0
+        chunks = 0
+        pcm_bytes = 0
+        ulaw_bytes = 0
         frames_queued = 0
+        max_queue_depth_seen = self.playback.queue_depth()
+        backpressure_events = 0
+        backpressure_wait_ms = 0
+        underrun_events = 0
         started = False
+        generation_complete = False
+        ok = False
+        cancelled = False
+        error_type: Optional[str] = None
 
         try:
             for pcm16, sample_rate in tts_module.iter_synthesize_pcm16_chunks(text):
                 if stop():
+                    cancelled = True
                     self.playback.flush()
                     return False
+                chunks += 1
+                pcm_bytes += len(pcm16)
+                if first_pcm_ms is None:
+                    first_pcm_ms = telemetry.elapsed_ms(tts_started)
+                    telemetry.log_event(
+                        "tts.first_pcm",
+                        session_id=session_id,
+                        label=label,
+                        elapsed_ms=first_pcm_ms,
+                        text_chars=len(text),
+                        pcm_bytes=len(pcm16),
+                        sample_rate=sample_rate,
+                    )
+
+                pending_before = self.playback.pending_frames()
+                queue_before = self.playback.queue_depth()
+                max_queue_depth_seen = max(max_queue_depth_seen, queue_before)
+                if started and pending_before <= 0:
+                    underrun_events += 1
+                    telemetry.log_event(
+                        "rtp.underrun",
+                        session_id=session_id,
+                        label=label,
+                        source="tts-stream",
+                        queue_depth=queue_before,
+                        pending_frames=pending_before,
+                    )
+
                 ulaw = media_module.pcm16_to_ulaw_bytes(
                     pcm16,
                     sample_rate=sample_rate,
@@ -1208,23 +1371,55 @@ class AsteriskHermesBridge:
                 )
                 if not ulaw:
                     continue
+                ulaw_bytes += len(ulaw)
 
+                wait_started: Optional[float] = None
                 while self.playback.queue_depth() > max_queue_depth:
                     if stop():
+                        cancelled = True
                         self.playback.flush()
                         return False
+                    if wait_started is None:
+                        wait_started = telemetry.now()
+                        backpressure_events += 1
                     time.sleep(0.01)
+                if wait_started is not None:
+                    waited_ms = telemetry.elapsed_ms(wait_started)
+                    backpressure_wait_ms += waited_ms
+                    telemetry.log_event(
+                        "rtp.backpressure",
+                        session_id=session_id,
+                        label=label,
+                        waited_ms=waited_ms,
+                        queue_depth=self.playback.queue_depth(),
+                        max_queue_depth=max_queue_depth,
+                    )
 
-                frames_queued += self.playback.enqueue(ulaw, marker=not started)
+                frames_queued += self.playback.enqueue(
+                    ulaw,
+                    marker=not started,
+                    session_id=session_id,
+                    label=label,
+                )
                 started = True
+                max_queue_depth_seen = max(
+                    max_queue_depth_seen,
+                    self.playback.queue_depth(),
+                )
+
+            generation_complete = True
+            total_generation_ms = telemetry.elapsed_ms(tts_started)
 
             if not started:
                 logger.warning(f"[{session_id}] Streaming TTS produced no audio for {label}")
                 return False
 
             timeout = max(5.0, frames_queued * RTP_FRAME_SECONDS + 2.0)
+            playback_wait_started = telemetry.now()
             self.playback.wait_until_idle(timeout=timeout)
+            playback_wait_ms = telemetry.elapsed_ms(playback_wait_started)
             if stop():
+                cancelled = True
                 self.playback.flush()
                 return False
 
@@ -1232,10 +1427,46 @@ class AsteriskHermesBridge:
                 f"[{session_id}] Played streaming {label}: "
                 f"{frames_queued} RTP packets -> {rtp.remote_addr}"
             )
+            ok = True
             return True
         except Exception as e:
+            error_type = type(e).__name__
             logger.exception(f"[{session_id}] Error streaming {label} TTS: {e}")
             return False
+        finally:
+            stats_after = self.playback.stats()
+            fields = {
+                "label": label,
+                "ok": ok,
+                "cancelled": cancelled,
+                "generation_complete": generation_complete,
+                "first_pcm_ms": first_pcm_ms,
+                "total_generation_ms": (
+                    total_generation_ms
+                    if total_generation_ms is not None
+                    else telemetry.elapsed_ms(tts_started)
+                ),
+                "playback_wait_ms": playback_wait_ms,
+                "text_chars": len(text),
+                "chunks": chunks,
+                "pcm_bytes": pcm_bytes,
+                "ulaw_bytes": ulaw_bytes,
+                "frames_queued": frames_queued,
+                "queue_depth_after": stats_after.get("queue_depth", 0),
+                "queue_depth_max_seen": max_queue_depth_seen,
+                "queue_high_watermark": stats_after.get("high_watermark", 0),
+                "backpressure_events": backpressure_events,
+                "backpressure_wait_ms": backpressure_wait_ms,
+                "underrun_events": underrun_events,
+                "underruns_delta": stats_after.get("underruns", 0)
+                - stats_before.get("underruns", 0),
+                "resyncs_delta": stats_after.get("resyncs", 0)
+                - stats_before.get("resyncs", 0),
+                "has_remote_peer": rtp.remote_addr is not None,
+            }
+            if error_type:
+                fields["error_type"] = error_type
+            telemetry.log_event("tts.stream", session_id=session_id, **fields)
 
 
 def main():

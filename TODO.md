@@ -25,23 +25,29 @@ dead-air handling, STT, agent routing, TTS, and RTP playback.
 - [x] Add `audioop-lts` compatibility for Python 3.13+.
 - [x] Add setup preflight checks in `scripts/preflight.py`.
 - [x] Add media unit tests.
+- [x] Add Asterisk-side DTMF PIN gate before `Stasis(hermes)`.
+- [x] Add preflight checks for the Asterisk PIN gate and optional required `HERMES_AGENT_PIN`.
+- [x] Add structured `perf` logging for STT transcription and agent request latency.
+- [x] Add structured `perf` logging for streaming TTS and RTP queue/underrun behavior.
 
 ## Next Up
 
 - [ ] Merge `asterisk-voice-agent-ux-skill` into `main` after review.
 - [ ] Run live-call validation on the real Asterisk/Hermes host:
-  - [ ] `python scripts/preflight.py`
+  - [ ] `python scripts/preflight.py --asterisk-config-dir /etc/asterisk --require-agent-pin`
   - [ ] `python -m unittest discover -s tests -v`
   - [ ] Dial `100` echo test.
-  - [ ] Dial `101` live agent test.
+  - [ ] Set `HERMES_AGENT_PIN` in Asterisk.
+  - [ ] Dial `101` live agent test and verify bad PINs never reach ARI/the agent.
   - [ ] Check first-turn latency, response start time, choppy playback, hangup cleanup, and barge-in behavior.
-- [ ] Add timing instrumentation around the live call path:
-  - [ ] STT transcription latency.
-  - [ ] Hermes/agent request latency.
-  - [ ] Time to first TTS PCM chunk.
-  - [ ] Total TTS generation time.
-  - [ ] RTP queue depth and underrun/backpressure events.
-- [ ] Update README language toward "Asterisk Voice Agent UX Skill" while keeping Hermes/Pipecat history clear.
+- [x] Add timing instrumentation around the live call path:
+  - [x] STT transcription latency.
+  - [x] Hermes/agent request latency.
+  - [x] Time to first TTS PCM chunk.
+  - [x] Total TTS generation time.
+  - [x] RTP queue depth and underrun/backpressure events.
+- [x] Update README language toward "Asterisk Voice Agent UX Skill" while keeping Hermes/Pipecat history clear.
+- [ ] Add optional caller-ID allowlist/rate-limit policy in Asterisk after PIN behavior is validated.
 
 ## Performance / Native Backend
 

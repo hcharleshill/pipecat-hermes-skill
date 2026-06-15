@@ -141,6 +141,27 @@ Include the dialplan in `extensions.conf`:
 #include /path/to/asterisk-config/hermes.conf
 ```
 
+### Agent PIN gate
+
+Extension **101** is protected by Asterisk before the call enters `Stasis(hermes)`.
+Set a numeric DTMF PIN in Asterisk, not in the Python bridge:
+
+```
+[globals]
+HERMES_AGENT_PIN=123456
+```
+
+Use a non-obvious 6+ digit PIN and do not commit your real value. If
+`HERMES_AGENT_PIN` is empty, extension **101** fails closed and hangs up before
+ARI/STT/the agent are reached.
+
+Preflight checks that the PIN gate is present. For a real deployment, point it
+at the live Asterisk config and require the PIN:
+
+```bash
+python scripts/preflight.py --asterisk-config-dir /etc/asterisk --require-agent-pin
+```
+
 ### Podman (example)
 
 Adjust image/volumes to your environment:
