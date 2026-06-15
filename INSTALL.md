@@ -88,12 +88,19 @@ cp config/config.example.yaml config/config.yaml
 
 ./scripts/download_piper_voice.sh
 mkdir -p sessions
+python scripts/preflight.py
 ```
 
 Run unit tests (stdlib + pydantic only for some tests; full suite needs venv):
 
 ```bash
 python -m unittest discover -s tests -v
+```
+
+Optionally verify the configured Hermes endpoint is reachable:
+
+```bash
+python scripts/preflight.py --online
 ```
 
 ---
@@ -201,7 +208,8 @@ Watch bridge logs on first transcription:
   to interrupt. Headset/isolated mode allows energy barge-in.
 - **Hermes latency:** Long tool loops can delay voice responses; spinner phrases play
   after ~7 s.
-- **Python 3.13:** `audioop` deprecation warning in bridge (stdlib removal planned).
+- **Python 3.13+:** stdlib `audioop` was removed; `requirements.txt` installs
+  `audioop-lts` to provide the same module API for the bridge.
 - **Single call:** Bridge handles one RTP session at a time by design.
 
 ---

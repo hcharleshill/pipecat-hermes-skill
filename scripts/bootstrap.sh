@@ -30,6 +30,9 @@ fi
 mkdir -p sessions models
 bash scripts/download_piper_voice.sh
 
+echo "Running local preflight ..."
+python scripts/preflight.py
+
 echo ""
 echo "Bootstrap complete. Next steps:"
 echo "  1. Edit config/config.yaml"

@@ -6,7 +6,7 @@ to perform text-to-speech using a local Piper model.
 """
 
 from piper import PiperVoice
-from typing import Optional
+from typing import Iterable, Optional
 import io
 import logging
 import threading
@@ -53,24 +53,40 @@ def _should_cache(text: str, use_cache: bool) -> bool:
     return use_cache and 0 < len(text.strip()) <= _TTS_CACHE_MAX_TEXT_LEN
 
 
-def _synthesize_wav_bytes_uncached(text: str, model_path: Optional[str] = None) -> bytes:
+def iter_synthesize_pcm16_chunks(
+    text: str,
+    model_path: Optional[str] = None,
+) -> Iterable[tuple[bytes, int]]:
+    """Yield Piper PCM16 chunks as (audio_int16_bytes, sample_rate)."""
     voice = get_voice(model_path)
-    chunks = list(voice.synthesize(text))
-    buf = io.BytesIO()
+    for chunk in voice.synthesize(text):
+        pcm = getattr(chunk, "audio_int16_bytes", b"")
+        if not pcm:
+            continue
+        sample_rate = getattr(chunk, "sample_rate", 22050) or 22050
+        yield pcm, int(sample_rate)
+
+
+def synthesize_to_pcm16(
+    text: str,
+    model_path: Optional[str] = None,
+) -> tuple[bytes, int]:
+    """Synthesize the full utterance to raw PCM16 bytes."""
+    chunks = list(iter_synthesize_pcm16_chunks(text, model_path))
     if not chunks:
-        with wave.open(buf, "wb") as wav_file:
-            wav_file.setnchannels(1)
-            wav_file.setsampwidth(2)
-            wav_file.setframerate(22050)
-            wav_file.writeframes(b"")
-    else:
-        pcm = b"".join(getattr(c, "audio_int16_bytes", b"") for c in chunks)
-        sr = getattr(chunks[0], "sample_rate", 22050) or 22050
-        with wave.open(buf, "wb") as wav_file:
-            wav_file.setnchannels(1)
-            wav_file.setsampwidth(2)
-            wav_file.setframerate(sr)
-            wav_file.writeframes(pcm)
+        return b"", 22050
+    sample_rate = chunks[0][1]
+    return b"".join(pcm for pcm, _ in chunks), sample_rate
+
+
+def _synthesize_wav_bytes_uncached(text: str, model_path: Optional[str] = None) -> bytes:
+    pcm, sr = synthesize_to_pcm16(text, model_path)
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sr)
+        wav_file.writeframes(pcm)
     return buf.getvalue()
 
 

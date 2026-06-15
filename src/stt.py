@@ -8,6 +8,9 @@ to perform speech-to-text using a local model.
 from faster_whisper import WhisperModel
 from typing import Optional
 import logging
+import numpy as np
+
+from . import media as media_module
 
 logger = logging.getLogger(__name__)
 
@@ -59,5 +62,35 @@ def transcribe(audio_path: str, language: Optional[str] = None) -> str:
     """
     model = get_model()
     segments, _ = model.transcribe(audio_path, language=language)
+    return _segments_to_text(segments)
+
+
+def transcribe_pcm16(
+    pcm16: bytes,
+    *,
+    sample_rate: int = 16000,
+    language: Optional[str] = None,
+) -> str:
+    """
+    Transcribe raw mono PCM16 without writing a temporary WAV file.
+
+    Faster-Whisper accepts a 16 kHz float32 waveform. Telephony input reaches
+    the skill as 16 kHz mono PCM16, so this is the low-overhead live-call path.
+    """
+    if not pcm16:
+        return ""
+    if sample_rate != 16000:
+        pcm16 = media_module.resample_pcm16(pcm16, sample_rate, 16000)
+    sample_bytes = len(pcm16) & ~1
+    if sample_bytes <= 0:
+        return ""
+    audio = np.frombuffer(pcm16[:sample_bytes], dtype="<i2").astype(np.float32)
+    audio *= 1.0 / 32768.0
+    model = get_model()
+    segments, _ = model.transcribe(audio, language=language)
+    return _segments_to_text(segments)
+
+
+def _segments_to_text(segments) -> str:
     text = " ".join(segment.text for segment in segments)
     return text.strip()

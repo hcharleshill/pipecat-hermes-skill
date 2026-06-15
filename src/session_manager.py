@@ -68,6 +68,8 @@ class SessionManager:
             pass
 
     def _is_expired(self, session: Dict[str, Any]) -> bool:
+        if self.timeout_seconds <= 0:
+            return True
         last = session.get("last_activity") or session.get("created_at", 0)
         return (time.time() - last) > self.timeout_seconds
 
@@ -123,6 +125,9 @@ class SessionManager:
         now = time.time()
         expired = []
         for sid, sess in list(self.sessions.items()):
+            if self.timeout_seconds <= 0:
+                expired.append(sid)
+                continue
             last = sess.get("last_activity") or sess.get("created_at", 0)
             if (now - last) > self.timeout_seconds:
                 expired.append(sid)

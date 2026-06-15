@@ -20,5 +20,8 @@ onnxruntime>=1.16.0
 requests>=2.31.0
 websocket-client>=1.6.0
 
+# Python 3.13 removed stdlib audioop; audioop-lts provides the same module API.
+audioop-lts>=0.2.2; python_version >= "3.13"
+
 # Transitive / runtime (pinned loosely — pip resolves per platform)
 numpy>=1.24.0
